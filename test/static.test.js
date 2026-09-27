@@ -70,6 +70,31 @@ function genericErrorResponseChecks (t, response) {
   t.assert.ok(response.headers.get?.('date') ?? response.headers.date)
 }
 
+function rawGet (port, requestPath) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1',
+      port,
+      path: requestPath,
+      method: 'GET',
+      agent: false
+    }, (response) => {
+      let body = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => { body += chunk })
+      response.on('end', () => {
+        resolve({
+          statusCode: response.statusCode,
+          body
+        })
+      })
+    })
+
+    request.on('error', reject)
+    request.end()
+  })
+}
+
 if (typeof Promise.withResolvers === 'undefined') {
   Promise.withResolvers = function () {
     let promiseResolve, promiseReject
@@ -3171,16 +3196,18 @@ test(
 
 test('should not redirect to protocol-relative locations', async (t) => {
   const urls = [
-    ['//^/..', '/', 301],
+    ['//^/..', null, 403],
     ['//^/.', null, 404], // it is NOT recognized as a directory by pillarjs/send
-    ['//:/..', '/', 301],
-    ['/\\\\a//google.com/%2e%2e%2f%2e%2e', '/a//google.com/%2e%2e%2f%2e%2e/', 301],
-    ['//a//youtube.com/%2e%2e%2f%2e%2e', '/a//youtube.com/%2e%2e%2f%2e%2e/', 301],
+    ['//:/..', null, 403],
+    ['/\\\\a//google.com/%2e%2e%2f%2e%2e', null, 403],
+    ['//a//youtube.com/%2e%2e%2f%2e%2e', null, 403],
     ['/^', null, 404], // it is NOT recognized as a directory by pillarjs/send
-    ['//google.com/%2e%2e', '/', 301],
-    ['//users/%2e%2e', '/', 301],
+    ['/deep/path/for/test/.', '/deep/path/for/test/', 301],
+    ['//google.com/%2e%2e', null, 403],
+    ['//users/%2e%2e', null, 403],
     ['//users', null, 404],
-    ['///deep/path//for//test//index.html', null, 200]
+    ['///deep/path//for//test//index.html', null, 200],
+    ['/index.html?redirect=/foo/../bar', null, 200]
   ]
 
   t.plan(urls.length * 2)
@@ -3790,4 +3817,136 @@ test('register with wildcard false and globIgnore', async t => {
     t.assert.deepStrictEqual(response.status, 404)
     await response.text()
   })
+})
+
+test('does not serve static files with dot-dot path segments', async (t) => {
+  t.plan(8)
+
+  const fastify = Fastify()
+
+  t.after(() => fastify.close())
+
+  fastify.all('/deep/*', async (_request, reply) => {
+    reply.code(401).send('Unauthorized')
+  })
+
+  fastify.register(fastifyStatic, {
+    root: path.join(__dirname, '/static')
+  })
+
+  await fastify.listen({ port: 0, host: '127.0.0.1' })
+  fastify.server.unref()
+
+  const response = await rawGet(fastify.server.address().port, '/deep/path/for/test/purpose/foo.html')
+  t.assert.deepStrictEqual(response.statusCode, 401)
+  t.assert.deepStrictEqual(response.body, 'Unauthorized')
+
+  for (const requestPath of [
+    '/foo/../deep/path/for/test/purpose/foo.html',
+    '/foo/%2e%2e/deep/path/for/test/purpose/foo.html',
+    '/foo/%2E%2E/deep/path/for/test/purpose/foo.html'
+  ]) {
+    const dotDotResponse = await rawGet(fastify.server.address().port, requestPath)
+    t.assert.deepStrictEqual(dotDotResponse.statusCode, 403)
+    t.assert.match(dotDotResponse.body, /Forbidden/u)
+  }
+})
+
+test('does not serve static files when dot-dot path segments are consumed by a route param', async (t) => {
+  t.plan(8)
+
+  const fastify = Fastify()
+
+  t.after(() => fastify.close())
+
+  fastify.all('/deep/*', async (_request, reply) => {
+    reply.code(401).send('Unauthorized')
+  })
+
+  fastify.register(fastifyStatic, {
+    root: path.join(__dirname, '/static'),
+    prefix: '/app/:version',
+    decorateReply: false
+  })
+
+  await fastify.listen({ port: 0, host: '127.0.0.1' })
+  fastify.server.unref()
+
+  const response = await rawGet(fastify.server.address().port, '/deep/path/for/test/purpose/foo.html')
+  t.assert.deepStrictEqual(response.statusCode, 401)
+  t.assert.deepStrictEqual(response.body, 'Unauthorized')
+
+  for (const requestPath of [
+    '/app/../deep/path/for/test/purpose/foo.html',
+    '/app/%2e%2e/deep/path/for/test/purpose/foo.html',
+    '/app/%2E%2E/deep/path/for/test/purpose/foo.html'
+  ]) {
+    const dotDotResponse = await rawGet(fastify.server.address().port, requestPath)
+    t.assert.deepStrictEqual(dotDotResponse.statusCode, 403)
+    t.assert.match(dotDotResponse.body, /Forbidden/u)
+  }
+})
+
+test('does not serve static files when dot-dot path segments are consumed by a route param with wildcard `false`', async (t) => {
+  t.plan(10)
+
+  const fastify = Fastify()
+
+  t.after(() => fastify.close())
+
+  fastify.all('/deep/*', async (_request, reply) => {
+    reply.code(401).send('Unauthorized')
+  })
+
+  fastify.register(fastifyStatic, {
+    root: path.join(__dirname, '/static'),
+    prefix: '/app/:version',
+    wildcard: false,
+    decorateReply: false
+  })
+
+  await fastify.listen({ port: 0, host: '127.0.0.1' })
+  fastify.server.unref()
+
+  const response = await rawGet(fastify.server.address().port, '/deep/path/for/test/purpose/foo.html')
+  t.assert.deepStrictEqual(response.statusCode, 401)
+  t.assert.deepStrictEqual(response.body, 'Unauthorized')
+
+  const allowedResponse = await rawGet(fastify.server.address().port, '/app/v1/deep/path/for/test/purpose/foo.html')
+  t.assert.deepStrictEqual(allowedResponse.statusCode, 200)
+  t.assert.deepStrictEqual(allowedResponse.body, deepContent)
+
+  for (const requestPath of [
+    '/app/../deep/path/for/test/purpose/foo.html',
+    '/app/%2e%2e/deep/path/for/test/purpose/foo.html',
+    '/app/%2E%2E/deep/path/for/test/purpose/foo.html'
+  ]) {
+    const dotDotResponse = await rawGet(fastify.server.address().port, requestPath)
+    t.assert.deepStrictEqual(dotDotResponse.statusCode, 403)
+    t.assert.match(dotDotResponse.body, /Forbidden/u)
+  }
+})
+
+test('sendFile rejects non-leading dot-dot path segments', async (t) => {
+  t.plan(2)
+
+  const fastify = Fastify()
+
+  t.after(() => fastify.close())
+
+  fastify.register(fastifyStatic, {
+    root: path.join(__dirname, '/static')
+  })
+
+  fastify.get('/dot-dot', (_request, reply) => {
+    reply.sendFile('foo/../index.html')
+  })
+
+  const response = await fastify.inject({
+    method: 'GET',
+    url: '/dot-dot'
+  })
+
+  t.assert.deepStrictEqual(response.statusCode, 403)
+  t.assert.match(response.body, /Forbidden/u)
 })
